@@ -10,9 +10,9 @@ Este projeto visa prevenir e monitorar incêndios na agricultura familiar utiliz
 ## Funcionalidades do Receptor
   - Recebe os dados via LoRa.
   - Processa os dados e os envia para a plataforma Thing Speak utilizando conexão Wi-Fi.
-  **Conexão WiFi**:
+  - **Conexão WiFi**:
     - O receptor se conecta a uma rede Wi-Fi configurada no código (ssid e password).
-  **Envio de Dados para o ThingSpeak**:
+  - **Envio de Dados para o ThingSpeak**:
     - Os dados recebidos via LoRa são enviados para a plataforma ThingSpeak
     - A URL de envio é construída dinamicamente com a chave da API (apiKey) e os campos correspondentes:
       - field1: temperatura
