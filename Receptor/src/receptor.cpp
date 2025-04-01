@@ -1,25 +1,33 @@
 #include <LoRa.h>
+#include <RadioLib.h>
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <SPI.h>
 
-#define LORA_SCK 5
-#define LORA_MISO 19
-#define LORA_MOSI 27
-#define LORA_SS 18
-#define LORA_RST 14
-#define LORA_DI0 26
+// Definição dos pinos SPI para o módulo LoRa
+#define LORA_CLK   SCK     // Pino de clock SPI
+#define LORA_MISO  MISO    // Pino MISO SPI
+#define LORA_MOSI  MOSI    // Pino MOSI SPI
+#define LORA_NSS   SS      // Pino de seleção de escravo SPI (Chip Select)
 
-#define SPREAD_FACTOR 12
-#define CODING_RATE 5
+SX1262 Lora = new Module(8, 14, 12, 13);
+
+volatile bool transmitFlag = false;  // Flag para indicar que um pacote foi recebido
+volatile bool enableInterrupt = true; // Habilita/desabilita interrupções
+
+// Função chamada ao receber um pacote LoRa
+void setFlag(void) {
+    if (!enableInterrupt) return; // Ignora se as interrupções estiverem desabilitadas
+    transmitFlag = true; // Sinaliza que um pacote foi recebido
+}
 
 // Configurações WiFi
-const char* ssid = "Nome da sua rede Wifi";
-const char* password = "Senha da sua rede Wifi";
+const char* ssid = "Sua rede WiFi"; // Substitua pelo nome da sua rede WiFi
+const char* password = "Sua senha WiFi"; // Substitua pela senha da sua rede WiFi
 
 // Configurações ThingSpeak
-const String apiKey = "Sua API do the thingSpeak";
+const String apiKey = "Sua API"; // Substitua pela sua API do The Thing Speak
 const String server = "http://api.thingspeak.com/update";
 
 void processReceivedData(const String &data, int rssi, float snr);
@@ -37,12 +45,35 @@ void setup() {
   Serial.println("\nConectado à WiFi!");
 
   // Inicializar LoRa
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DI0);
-  if (!LoRa.begin(915E6)) {  
-    Serial.println("Erro ao iniciar LoRa!");
-    while (1);
-  }
-  Serial.println("LoRa inicializado com sucesso!");
+  SPI.begin(LORA_CLK, LORA_MISO, LORA_MOSI, LORA_NSS);
+
+   // Inicializa o módulo LoRa
+   Serial.print("Iniciando LoRa... ");
+   int state = Lora.begin(915.0); // Frequência de 915 MHz (ajuste para 868 MHz se necessário)
+   if (state == RADIOLIB_ERR_NONE) {
+     Serial.println("Sucesso!");
+   } else {
+     Serial.print("Falha, código: ");
+     Serial.println(state);
+     while (true); // Trava o programa se o LoRa não iniciar
+   }
+    // Configuração para alcance máximo
+    state = Lora.setSpreadingFactor(7); // SF7
+    state = Lora.setCodingRate(5); // CR5
+    state = Lora.setOutputPower(22); // 22 dBm
+ 
+   // Configura a interrupção para receber pacotes
+   Lora.setDio1Action(setFlag);
+   Serial.print("Iniciando recepção... ");
+   state = Lora.startReceive();
+   if (state == RADIOLIB_ERR_NONE) {
+     Serial.println("Sucesso!");
+   } else {
+     Serial.print("Falha, código: ");
+     Serial.println(state);
+     while (true);
+   }
+ 
 }
 
 void loop() {
@@ -53,42 +84,40 @@ void loop() {
     delay(5000);
   }
 
-  // Verificar se há um pacote LoRa
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    long receivedTimestamp = 0;
-    String receivedData = "";
-    // Lê o RSSI do último pacote recebido
-    //int rssi = LoRa.packetRssi();
-    Serial.println("\n====================================================");
-    //Serial.print("RSSI: ");
-    //Serial.println(rssi);
-    while (LoRa.available()) {
-      receivedData += (char)LoRa.read();
+  // Verifica se um pacote foi recebido
+  if (transmitFlag) {
+    transmitFlag = false; // Reseta a flag
+    enableInterrupt = false; // Desabilita interrupções temporariamente
+
+    // Lê o pacote recebido
+    String receivedData;
+    int state = Lora.readData(receivedData);
+
+    if (state == RADIOLIB_ERR_NONE) {
+      // Exibe os dados recebidos no monitor serial
+      Serial.println("\n====================================================");
+      Serial.println("Dados recebidos: " + receivedData);
+
+      // Obtém a intensidade do sinal RSSI e SNR
+      int16_t rssi = Lora.getRSSI();
+      float snr = Lora.getSNR();
+
+      // Exibe o RSSI e SNR
+      Serial.print("RSSI: ");
+      Serial.print(rssi);
+      Serial.print(" dBm | SNR: ");
+      Serial.print(snr);
+      Serial.println(" dB");
+
+      // Processa os dados recebidos
+      processReceivedData(receivedData, rssi, snr);
+    } else {
+      Serial.println("Erro ao receber dados!");
     }
 
-    receivedTimestamp = receivedData.toInt();
-    long currentTime = millis();  // Captura o tempo atual ao receber o pacote
-    long uplinkTime = currentTime - receivedTimestamp;  // Calcula o tempo de uplink
-
-    // Exibir dados recebidos
-    Serial.println("Dados recebidos:");
-    Serial.println(receivedData);
-    
-    int rssi = LoRa.packetRssi();
-    float snr = LoRa.packetSnr();
-
-    Serial.print(" | Tempo de Uplink: ");
-    Serial.print(uplinkTime);
-    Serial.print(" ms | RSSI: ");
-    Serial.print(rssi);
-    Serial.print(" dBm | SNR: ");
-    Serial.print(snr);
-    Serial.println(" dB");
-    
-    // Processar os dados recebidos
-    processReceivedData(receivedData, rssi, snr);
-
+    // Reativa a recepção de pacotes
+    Lora.startReceive();
+    enableInterrupt = true; // Reabilita interrupções
   }
 }
 
@@ -149,4 +178,4 @@ void processReceivedData(const String &data, int rssi, float snr) {
     Serial.println("Formato inesperado dos dados recebidos.");
   }
 }
-
+ 

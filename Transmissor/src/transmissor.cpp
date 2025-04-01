@@ -1,42 +1,43 @@
 #include <MQUnifiedsensor.h>
 #include "DHT.h"
-#include <LoRa.h>
+#include <RadioLib.h>
 #include <Fuzzy.h>
 
-const int flamePin = 17;
-const int sampleSize = 10;
+// Definição dos pinos SPI para o módulo LoRa
+#define LORA_CLK   SCK     // Pino de clock SPI
+#define LORA_MISO  MISO    // Pino MISO SPI
+#define LORA_MOSI  MOSI    // Pino MOSI SPI
+#define LORA_NSS   SS      // Pino de seleção de escravo SPI (Chip Select)
 
-//relÃ©
-const int RelePin = 26; // pino ao qual o MÃ³dulo RelÃ© estÃ¡ conectado
-int incomingByte;      // variavel para ler dados recebidos pela serial
+void setFlag(void); 
 
-#define DHTPIN 4
+// Sensores
+const int flamePin = 39; // Pino do sensor de chama
+const int sampleSize = 10; // Tamanho da amostra para leitura do sensor de chama
+const int RelePin = 40; // Pino do relé
+#define DHTPIN 41 // Pino do DHT22
 #define DHTTYPE DHT22
 
-#define placa "Heltec WiFi LoRa(V2)"
+// Configuração do MQ-135
+#define placa "Heltec WiFi LoRa(V3)"
 #define Voltage_Resolution 5
-#define pin 13 // Analog input pin
+#define pin 2 // Pino analógico do MQ-135
 #define type "MQ-135"
 #define ADC_Bit_Resolution 12
 #define RatioMQ135CleanAir 3.6
 
-#define CO2_THRESHOLD 1000
-
-// Pinos SPI para LoRa
-#define LORA_SCK 5
-#define LORA_MISO 19
-#define LORA_MOSI 27
-#define LORA_SS 18
-#define LORA_RST 14
-#define LORA_DI0 26
-
-#define SPREADING_FACTOR 12     
-#define CODING_RATE      5  
-
-// Sensores
+// Inicialização dos sensores
 MQUnifiedsensor MQ135(placa, Voltage_Resolution, ADC_Bit_Resolution, pin, type);
 DHT dht(DHTPIN, DHTTYPE);
 
+// Inicialização do LoRa
+SX1262 Lora = new Module(8, 14, 12, 13);
+
+// Variáveis de controle do LoRa
+volatile bool transmitFlag = false;  // Flag para indicar que um pacote foi recebido
+volatile bool enableInterrupt = true; // Habilita/desabilita interrupções
+
+// Lógica Fuzzy
 Fuzzy *fuzzy = new Fuzzy();
 
 // Conjuntos Fuzzy para Temperatura
@@ -58,29 +59,28 @@ FuzzySet *co2Alto = new FuzzySet(900, 1500, 1500, 2000);
 FuzzySet *semChama = new FuzzySet(0, 0, 0, 1);
 FuzzySet *comChama = new FuzzySet(1, 1, 1, 1);
 
-// Conjuntos Fuzzy para Risco de IncÃªndio
+// Conjuntos Fuzzy para Risco de Incêndio
 FuzzySet *riscoBaixo = new FuzzySet(0, 15, 15, 30);
 FuzzySet *riscoMedio = new FuzzySet(30, 55, 55, 70);
 FuzzySet *riscoAlto = new FuzzySet(70, 85, 85, 100);
 
-// DeclaraÃ§Ã£o da funÃ§Ã£o readFlameSensor
+// Declaração das funções
+void setFlag(void);
 bool readFlameSensor();
 void criarRegraFuzzy(Fuzzy* fuzzy, int id, FuzzySet* temperatura, FuzzySet* umidade, FuzzySet* co2, FuzzySet* chama, FuzzySet* risco);
 
 void setup() {
   Serial.begin(115200);
   pinMode(flamePin, INPUT);
-
-  //relÃ©
-  pinMode(RelePin, OUTPUT); // seta o pino como saÃ­da
-  digitalWrite(RelePin, LOW); // seta o pino com nivel logico baixo
+  pinMode(RelePin, OUTPUT);
+  digitalWrite(RelePin, LOW);
 
   dht.begin();
-  MQ135.setRegressionMethod(1); 
-  MQ135.setA(110.47); MQ135.setB(-2.862); 
+  MQ135.setRegressionMethod(1);
+  MQ135.setA(110.47); MQ135.setB(-2.862);
   MQ135.init();
 
-  Serial.print("Calibrando... ");
+  Serial.print("Calibrando MQ-135... ");
   float calcR0 = 0;
   for (int i = 1; i <= 10; i++) {
     MQ135.update();
@@ -90,20 +90,31 @@ void setup() {
   MQ135.setR0(calcR0 / 10);
   Serial.println(" Pronto!");
 
-  // InicializaÃ§Ã£o LoRa
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DI0);
-  
-  if (!LoRa.begin(915E6)) {
-    Serial.println("Erro ao iniciar LoRa!");
-    while (1);
+  // Inicialização do LoRa
+  SPI.begin(LORA_CLK, LORA_MISO, LORA_MOSI, LORA_NSS);
+  Serial.print("Iniciando LoRa... ");
+  int state = Lora.begin(915.0); // Frequência de 915 MHz (ajuste para 868 MHz se necessário)
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println("Sucesso!");
+  } else {
+    Serial.print("Falha, código: ");
+    Serial.println(state);
+    while (true);
   }
-  LoRa.setSpreadingFactor(SPREADING_FACTOR);
-  LoRa.setCodingRate4(CODING_RATE);
-  
-  Serial.println("LoRa iniciado!");
 
-  // Configurar lÃ³gica fuzzy
+  // Configura a interrupção para receber pacotes
+  Lora.setDio1Action(setFlag);
+  Serial.print("Iniciando recepção... ");
+  state = Lora.startReceive();
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println("Sucesso!");
+  } else {
+    Serial.print("Falha, código: ");
+    Serial.println(state);
+    while (true);
+  }
+
+  // Configurar lógica fuzzy
   FuzzyInput *temperatura = new FuzzyInput(1);
   temperatura->addFuzzySet(temperaturaBaixa);
   temperatura->addFuzzySet(temperaturaMedia);
@@ -153,6 +164,11 @@ void setup() {
   criarRegraFuzzy(fuzzy, 18, temperaturaMedia, umidadeAlta, co2Baixo, comChama, riscoAlto);
   criarRegraFuzzy(fuzzy, 19, temperaturaMedia, umidadeMedia, co2Baixo, comChama, riscoAlto);
   criarRegraFuzzy(fuzzy, 20, temperaturaMedia, umidadeMedia, co2Baixo, semChama, riscoBaixo);
+ // Configuração para alcance máximo
+ state = Lora.setSpreadingFactor(7); // SF7
+ state = Lora.setCodingRate(5); // CR5
+ state = Lora.setOutputPower(22); // 22 dBm
+
 }
 
 void loop() {
@@ -162,8 +178,6 @@ void loop() {
 
   float temperature = dht.readTemperature();
   float humidity = dht.readHumidity();
-
-  long timestamp = millis(); //captura o tempo atual
 
   if (isnan(temperature) || isnan(humidity)) {
     Serial.println("Falha na leitura do DHT22!");
@@ -184,31 +198,31 @@ void loop() {
   Serial.print("Umidade: "); Serial.print(humidity); Serial.println(" *%");
   Serial.print("CO2: "); Serial.print(co2_ppm); Serial.println(" ppm");
   Serial.print("Chama: "); Serial.println(flameDetected);
-  Serial.print("NÃ­vel de Risco: "); Serial.println(fireRisk);
+  Serial.print("Nível de Risco: "); Serial.println(fireRisk);
 
-  // Acionar o relÃ© apenas em caso de risco alto
+  // Acionar o relé apenas em caso de risco alto
   if (fireRisk >= 70) { // Considerando 70 como risco alto
-    Serial.println("Risco alto detectado! Acionando relÃ©...");
-    digitalWrite(RelePin, HIGH); // Liga o relÃ©
+    Serial.println("Risco alto detectado! Acionando relé...");
+    digitalWrite(RelePin, HIGH); // Liga o relé
   } else {
-    Serial.println("Risco baixo ou mÃ©dio. Mantendo relÃ© desligado.");
-    digitalWrite(RelePin, LOW); // Desliga o relÃ©
+    Serial.println("Risco baixo ou médio. Mantendo relé desligado.");
+    digitalWrite(RelePin, LOW); // Desliga o relé
   }
 
   // Enviar dados via LoRa
   Serial.println("\n=================================================");
-  Serial.println("Enviando dados via Lora...");
-  LoRa.beginPacket();
-  LoRa.print("Temperatura: "); LoRa.print(temperature);
-  LoRa.print(" *C, CO2: "); LoRa.print(co2_ppm);
-  LoRa.print(" ppm, Chama: "); LoRa.print(flameDetected);
-  LoRa.print(", Umidade: "); LoRa.print(humidity);
-  LoRa.print(", Risco: "); LoRa.print(fireRisk);
-  LoRa.print(", Time stamp: ");LoRa.println(timestamp);
-  LoRa.endPacket();
+  Serial.println("Enviando dados via LoRa...");
+  String data = "Temperatura: " + String(temperature) + " *C, CO2: " + String(co2_ppm) + " ppm, Chama: " + String(flameDetected) + ", Umidade: " + String(humidity) + ", Risco: " + String(fireRisk);
+    // Envia os dados via LoRa
+  int state = Lora.startTransmit(data);
+  if (state == RADIOLIB_ERR_NONE) {
+      Serial.println("Dados enviados com sucesso!");
+  } else {
+      Serial.print("Falha ao enviar dados, código: ");
+      Serial.println(state);
+  }
 
-
-  delay(10000); //10 segundos
+  delay(10000); // 10 segundos
 }
 
 bool readFlameSensor() {
@@ -221,19 +235,22 @@ bool readFlameSensor() {
 }
 
 void criarRegraFuzzy(Fuzzy* fuzzy, int id, FuzzySet* temperatura, FuzzySet* umidade, FuzzySet* co2, FuzzySet* chama, FuzzySet* risco) {
-    // Cria o antecedente da regra
     FuzzyRuleAntecedent* antecedente = new FuzzyRuleAntecedent();
     FuzzyRuleAntecedent* tempUmidade = new FuzzyRuleAntecedent();
-    tempUmidade->joinWithAND(temperatura, umidade); // Junta temperatura e umidade
+    tempUmidade->joinWithAND(temperatura, umidade);
     FuzzyRuleAntecedent* tempUmidadeCO2 = new FuzzyRuleAntecedent();
-    tempUmidadeCO2->joinWithAND(tempUmidade, co2); // Adiciona CO2
-    antecedente->joinWithAND(tempUmidadeCO2, chama); // Adiciona chama
+    tempUmidadeCO2->joinWithAND(tempUmidade, co2);
+    antecedente->joinWithAND(tempUmidadeCO2, chama);
 
-    // Cria o consequente da regra
     FuzzyRuleConsequent* consequente = new FuzzyRuleConsequent();
-    consequente->addOutput(risco); // Define o risco
+    consequente->addOutput(risco);
 
-    // Cria a regra fuzzy
     FuzzyRule* fuzzyRule = new FuzzyRule(id, antecedente, consequente);
-    fuzzy->addFuzzyRule(fuzzyRule); // Adiciona a regra ao sistema fuzzy
+    fuzzy->addFuzzyRule(fuzzyRule);
+}
+
+// Função chamada ao receber um pacote LoRa
+void setFlag(void) {
+  if (!enableInterrupt) return;
+  transmitFlag = true;
 }
